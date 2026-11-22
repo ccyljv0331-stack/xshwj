@@ -20,7 +20,7 @@ CREATE INDEX IF NOT EXISTS idx_docs_category   ON docs (category);
 CREATE INDEX IF NOT EXISTS idx_docs_created_at ON docs (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_docs_is_top     ON docs (is_top);
 
--- 管理员表（密码使用 bcrypt 哈希，不存明文）
+-- 管理员表（密码使用 PBKDF2-SHA256 哈希，不存明文；Edge 运行时无法使用 bcrypt）
 CREATE TABLE IF NOT EXISTS admin_users (
   id            SERIAL PRIMARY KEY,
   username      TEXT        NOT NULL UNIQUE,
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS admin_users (
 );
 
 -- 初始管理员：admin / suadmin123
--- 哈希对应明文 suadmin123（bcrypt, cost=10）
+-- 哈希对应明文 suadmin123（PBKDF2-SHA256, 100000 次迭代）
 INSERT INTO admin_users (username, password_hash, real_name)
-SELECT 'admin', '$2b$10$TD8yrZFssQkOEzLty67ITubzO0BIucqjAAnsC3rIhD/tww0C5r9ge', '系统管理员'
+SELECT 'admin', 'pbkdf2$100000$jdjN-0hGTt5OOdwkcpFkvA$mFKNCCyVGLVyOE3QngcY8SAVzVauIK1hgt3jJhps8fI', '系统管理员'
 WHERE NOT EXISTS (SELECT 1 FROM admin_users WHERE username = 'admin');
