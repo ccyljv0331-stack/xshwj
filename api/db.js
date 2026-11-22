@@ -1,8 +1,11 @@
 import { neon } from '@neondatabase/serverless';
-import bcrypt from 'bcryptjs';
 
 // Vercel Edge Function 运行时声明
+// 注意：Edge 运行时不能用 bcryptjs（依赖 Node crypto），密码哈希统一用 WebCrypto PBKDF2
 export const config = { runtime: 'edge' };
+
+const PBKDF2_ITERATIONS = 100000;
+const PBKDF2_HASH_LENGTH = 256;
 
 const CATEGORIES = ['通知公告', '红头文件', '活动方案', '会议记录', '表彰公示'];
 const TOKEN_TTL = 7 * 24 * 60 * 60 * 1000; // 7 天
@@ -74,6 +77,59 @@ function base64UrlToBytes(value) {
   const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
   const binary = atob(padded);
   return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+}
+
+/* ---------------- 密码哈希（WebCrypto PBKDF2-SHA256，Edge 可用） ---------------- */
+
+async function deriveKeyBits(password, salt, iterations) {
+  const material = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(password),
+    'PBKDF2',
+    false,
+    ['deriveBits']
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+    material,
+    PBKDF2_HASH_LENGTH
+  );
+  return new Uint8Array(bits);
+}
+
+// 存储格式：pbkdf2$100000$<saltBase64Url>$<hashBase64Url>
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await deriveKeyBits(password, salt, PBKDF2_ITERATIONS);
+  return `pbkdf2$${PBKDF2_ITERATIONS}$${bytesToBase64Url(salt)}$${bytesToBase64Url(hash)}`;
+}
+
+async function verifyPassword(password, stored) {
+  if (typeof stored !== 'string' || !stored.startsWith('pbkdf2$')) {
+    // 旧版 bcrypt 哈希在 Edge 运行时无法校验，需要执行 sql/migrate-pbkdf2.sql 迁移
+    return false;
+  }
+  const parts = stored.split('$');
+  if (parts.length !== 4) return false;
+  const iterations = Number.parseInt(parts[1], 10);
+  if (!Number.isInteger(iterations) || iterations <= 0) return false;
+
+  let salt;
+  let expected;
+  try {
+    salt = base64UrlToBytes(parts[2]);
+    expected = base64UrlToBytes(parts[3]);
+  } catch {
+    return false;
+  }
+
+  const actual = await deriveKeyBits(password, salt, iterations);
+  if (actual.length !== expected.length) return false;
+
+  // 恒定时间比较
+  let diff = 0;
+  for (let i = 0; i < actual.length; i++) diff |= actual[i] ^ expected[i];
+  return diff === 0;
 }
 
 async function signingKey() {
@@ -246,7 +302,7 @@ async function login(req) {
   const admin = rows[0];
   if (!admin) throw new HttpError(401, '用户名或密码错误');
 
-  const ok = await bcrypt.compare(password, admin.password_hash);
+  const ok = await verifyPassword(password, admin.password_hash);
   if (!ok) throw new HttpError(401, '用户名或密码错误');
 
   return json({
@@ -332,7 +388,7 @@ async function createAdmin(req) {
   const exists = await sql`SELECT id FROM admin_users WHERE username = ${username} LIMIT 1`;
   if (exists.length) throw new HttpError(409, '该用户名已存在');
 
-  const passwordHash = await bcrypt.hash(password, 10);
+  const passwordHash = await hashPassword(password);
   const rows = await sql`
     INSERT INTO admin_users (username, password_hash, real_name)
     VALUES (${username}, ${passwordHash}, ${realName || username})
