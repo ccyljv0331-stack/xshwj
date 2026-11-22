@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS docs (
   dept        TEXT        NOT NULL,
   category    TEXT        NOT NULL,
   content     TEXT        NOT NULL DEFAULT '',
-  file_url    TEXT,
+  file_url    TEXT,                              -- 兼容旧数据：外部直链
+  file_path   TEXT,                              -- FileBrowser 内路径（后台上传后自动写入）
+  file_name   TEXT,                              -- 原始文件名，用于展示与下载名
   is_top      BOOLEAN     NOT NULL DEFAULT FALSE,
   view_count  INTEGER     NOT NULL DEFAULT 0,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()

@@ -67,8 +67,8 @@ function drawWatermark(ctx, width, height) {
 
 async function renderPdf() {
   if (!doc.value) return;
-  if (!doc.value.file_url) {
-    error.value = '该文件未配置文件直链，暂不支持在线预览';
+  if (!doc.value.file_path && !doc.value.file_url) {
+    error.value = '该文件未配置附件，暂不支持在线预览';
     loading.value = false;
     return;
   }
@@ -156,9 +156,9 @@ onBeforeUnmount(() => {
         <div class="toolbar-actions">
           <span v-if="pages.length" class="page-count">{{ pages.length }} 页</span>
           <el-button
-            v-if="doc?.file_url"
+            v-if="doc?.file_path || doc?.file_url"
             tag="a"
-            :href="doc.file_url"
+            :href="`/api/db?action=download&id=${doc.id}`"
             target="_blank"
             rel="noopener"
             size="small"

@@ -44,6 +44,34 @@ export const api = {
   getDoc: (id) => request('doc', { params: { id } }),
   increaseView: (id) => request('view', { method: 'POST', body: { id } }),
 
+  // 上传文件到 FileBrowser（multipart，走服务端代理）
+  uploadFile: async (file) => {
+    const url = new URL('/api/db', window.location.origin);
+    url.searchParams.set('action', 'upload');
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const headers = {};
+    const token = getToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+
+    let response;
+    try {
+      response = await fetch(url, { method: 'POST', headers, body: formData });
+    } catch {
+      throw new Error('上传失败，请检查网络后重试');
+    }
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      if (response.status === 401) clearAuth();
+      const error = new Error(data.error || `上传失败（${response.status}）`);
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  },
   login: (username, password) =>
     request('login', { method: 'POST', body: { username, password } }),
 

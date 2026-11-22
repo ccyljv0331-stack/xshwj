@@ -23,6 +23,24 @@ const notFound = ref(false);
 const deleting = ref(false);
 const doc = ref(null);
 const loggedIn = computed(() => isLoggedIn());
+const hasFile = computed(() => Boolean(doc.value?.file_path || doc.value?.file_url));
+const fileExt = computed(() => {
+  const name = doc.value?.file_name || doc.value?.file_url || '';
+  const match = /\.([a-zA-Z0-9]+)(?:\?|$)/.exec(name);
+  return match ? match[1].toLowerCase() : '';
+});
+// PDF 可在线预览；旧数据只有直链时按 PDF 处理
+const canPreview = computed(() => fileExt.value === 'pdf' || (Boolean(doc.value?.file_url) && !doc.value?.file_name));
+const downloadUrl = computed(() =>
+  doc.value ? `/api/db?action=download&id=${doc.value.id}` : '#'
+);
+// Word/Excel/PPT 用 Office 在线预览（服务端已公开可访问的下载地址）
+const officePreviewUrl = computed(() =>
+  doc.value
+    ? `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(window.location.origin + downloadUrl.value)}`
+    : '#'
+);
+const showOfficePreview = computed(() => hasFile.value && fileExt.value && fileExt.value !== 'pdf');
 
 async function load() {
   loading.value = true;
@@ -133,21 +151,32 @@ onMounted(load);
       <el-empty v-else description="暂无正文内容" :image-size="76" />
 
       <div class="article-actions">
-        <el-button v-if="doc.file_url" type="primary" @click="goPreview">
+        <el-button v-if="canPreview" type="primary" @click="goPreview">
           <el-icon><View /></el-icon>
           PDF 在线预览
         </el-button>
         <el-button v-else type="primary" disabled>暂无 PDF 文件</el-button>
 
         <el-button
-          v-if="doc.file_url"
+          v-if="hasFile"
           tag="a"
-          :href="doc.file_url"
+          :href="downloadUrl"
           target="_blank"
           rel="noopener"
         >
           <el-icon><Download /></el-icon>
-          下载文件
+          {{ fileExt && fileExt !== 'pdf' ? `下载 ${fileExt.toUpperCase()} 文件` : '下载文件' }}
+        </el-button>
+
+        <el-button
+          v-if="showOfficePreview"
+          tag="a"
+          :href="officePreviewUrl"
+          target="_blank"
+          rel="noopener"
+        >
+          <el-icon><View /></el-icon>
+          Office 在线预览
         </el-button>
 
         <template v-if="loggedIn">

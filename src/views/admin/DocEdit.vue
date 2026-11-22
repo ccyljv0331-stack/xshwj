@@ -12,7 +12,12 @@ const isEdit = computed(() => Boolean(route.params.id));
 const formRef = ref();
 const loading = ref(false);
 const saving = ref(false);
+const uploading = ref(false);
 const meta = ref(null);
+const fileInput = ref(null);
+
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
+const ACCEPT_EXT = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'];
 
 const form = reactive({
   title: '',
@@ -20,8 +25,13 @@ const form = reactive({
   category: '通知公告',
   content: '',
   file_url: '',
+  file_path: '',
+  file_name: '',
   is_top: false,
 });
+
+// 有点击上传的文件时，预览与下载都走服务端代理
+const hasUploaded = computed(() => Boolean(form.file_path));
 
 const validateFileUrl = (rule, value, callback) => {
   if (!value) return callback();
@@ -44,6 +54,44 @@ const rules = {
   file_url: [{ validator: validateFileUrl, trigger: 'blur' }],
 };
 
+function pickFile() {
+  fileInput.value?.click();
+}
+
+async function onFileChange(event) {
+  const input = event.target;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  if (!ACCEPT_EXT.includes(ext)) {
+    ElMessage.error(`仅支持 ${ACCEPT_EXT.join(' / ')} 格式`);
+    return;
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    ElMessage.error('文件超过 4MB，请先在 FileBrowser 网页上传，再把直链粘贴到「外部直链」');
+    return;
+  }
+
+  uploading.value = true;
+  try {
+    const res = await api.uploadFile(file);
+    form.file_path = res.file_path;
+    form.file_name = res.file_name;
+    ElMessage.success(`已上传：${res.file_name}`);
+  } catch (error) {
+    ElMessage.error(error.message);
+  } finally {
+    uploading.value = false;
+  }
+}
+
+function clearFile() {
+  form.file_path = '';
+  form.file_name = '';
+}
+
 async function submit() {
   if (!formRef.value) return;
   const valid = await formRef.value.validate().catch(() => false);
@@ -57,6 +105,8 @@ async function submit() {
       category: form.category,
       content: form.content,
       file_url: form.file_url,
+      file_path: form.file_path,
+      file_name: form.file_name,
       is_top: form.is_top,
     };
 
@@ -91,6 +141,8 @@ onMounted(async () => {
     form.category = doc.category;
     form.content = doc.content || '';
     form.file_url = doc.file_url || '';
+    form.file_path = doc.file_path || '';
+    form.file_name = doc.file_name || '';
     form.is_top = Boolean(doc.is_top);
   } catch (error) {
     ElMessage.error(error.message);
@@ -145,13 +197,42 @@ onMounted(async () => {
           />
         </el-form-item>
 
-        <el-form-item label="FileBrowser 文件直链" prop="file_url">
+        <el-form-item label="文件附件（可选）">
+          <div class="upload-box">
+            <input
+              ref="fileInput"
+              type="file"
+              accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
+              hidden
+              @change="onFileChange"
+            />
+            <div class="upload-row">
+              <el-button :loading="uploading" @click="pickFile">
+                {{ uploading ? '上传中…' : '选择文件上传' }}
+              </el-button>
+              <span class="field-hint inline">PDF / Word / Excel / PPT，单个不超过 4MB</span>
+            </div>
+
+            <div v-if="form.file_name" class="uploaded-file">
+              <span class="uploaded-name">{{ form.file_name }}</span>
+              <el-button link type="danger" @click="clearFile">移除</el-button>
+            </div>
+
+            <div class="field-hint">
+              文件直接上传到学生会 FileBrowser，发布后详情页自动出现预览/下载按钮。
+              超过 4MB 的文件请先在 FileBrowser 网页上传，再把直链填到下方「外部直链」。
+            </div>
+          </div>
+        </el-form-item>
+
+        <el-form-item label="外部直链（可选，替代上传）" prop="file_url">
           <el-input
             v-model="form.file_url"
+            :disabled="hasUploaded"
             placeholder="https://file.example.com/api/public/dl/xxxx?token=xxxx"
           />
           <div class="field-hint">
-            填写 FileBrowser 的公开分享直链（http/https）。填写后详情页会出现 PDF 预览与下载按钮。
+            {{ hasUploaded ? '已上传文件，外部直链不生效；如需改用直链请先移除已上传文件。' : 'FileBrowser 公开分享直链（http/https）。' }}
           </div>
         </el-form-item>
 
@@ -209,6 +290,37 @@ onMounted(async () => {
 
 .field-hint.inline {
   margin-top: 0;
+}
+
+.upload-box {
+  width: 100%;
+}
+
+.upload-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.uploaded-file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border: 1px dashed #c7d2fe;
+  border-radius: 8px;
+  background: #f5f7ff;
+  max-width: 100%;
+}
+
+.uploaded-name {
+  font-size: 13px;
+  color: var(--brand-dark);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .switch-row {

@@ -190,12 +190,19 @@ function parseDocInput(body) {
   const category = text(body.category);
   const content = typeof body.content === 'string' ? body.content : '';
   const fileUrl = text(body.file_url);
+  const filePath = text(body.file_path);
+  const fileName = text(body.file_name).slice(0, 160);
 
   if (!title) throw new HttpError(400, '请填写文件标题');
   if (title.length > 200) throw new HttpError(400, '标题不能超过 200 个字符');
   if (!dept) throw new HttpError(400, '请填写发布部门');
   if (dept.length > 100) throw new HttpError(400, '发布部门不能超过 100 个字符');
   if (!CATEGORIES.includes(category)) throw new HttpError(400, '请选择有效的文件分类');
+
+  // file_path 由服务端上传接口返回，只允许绝对路径且不能包含穿越片段
+  if (filePath && (!filePath.startsWith('/') || filePath.includes('..') || filePath.length > 300)) {
+    throw new HttpError(400, '文件路径不合法，请重新上传');
+  }
 
   if (fileUrl) {
     let parsed;
@@ -215,6 +222,8 @@ function parseDocInput(body) {
     category,
     content,
     file_url: fileUrl || null,
+    file_path: filePath || null,
+    file_name: fileName || null,
     is_top: body.is_top === true,
   };
 }
@@ -317,8 +326,8 @@ async function createDoc(req) {
   const input = parseDocInput(await readBody(req));
 
   const rows = await sql`
-    INSERT INTO docs (title, dept, category, content, file_url, is_top)
-    VALUES (${input.title}, ${input.dept}, ${input.category}, ${input.content}, ${input.file_url}, ${input.is_top})
+    INSERT INTO docs (title, dept, category, content, file_url, file_path, file_name, is_top)
+    VALUES (${input.title}, ${input.dept}, ${input.category}, ${input.content}, ${input.file_url}, ${input.file_path}, ${input.file_name}, ${input.is_top})
     RETURNING *
   `;
   return json({ doc: rows[0] }, 201);
@@ -338,6 +347,8 @@ async function updateDoc(req) {
       category = ${input.category},
       content = ${input.content},
       file_url = ${input.file_url},
+      file_path = ${input.file_path},
+      file_name = ${input.file_name},
       is_top = ${input.is_top}
     WHERE id = ${id}
     RETURNING *
@@ -415,45 +426,207 @@ async function deleteAdmin(req) {
   return json({ ok: true });
 }
 
-/**
- * PDF 代理：后端转发 FileBrowser 直链，避免浏览器跨域限制。
- * 仅按文档 id 取库中已登记的 file_url，不接收任意 URL。
- */
-async function proxyPdf(url) {
-  const sql = getSql();
-  const id = parseId(url.searchParams.get('id'));
-  const rows = await sql`SELECT file_url FROM docs WHERE id = ${id}`;
-  const fileUrl = rows[0]?.file_url;
-  if (!fileUrl) throw new HttpError(404, '该文件未配置文件直链');
+/* ---------------- FileBrowser：上传 / 鉴权 / 流式读取 ---------------- */
 
-  let target;
-  try {
-    target = new URL(fileUrl);
-  } catch {
-    throw new HttpError(400, '文件直链格式不正确');
-  }
-  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
-    throw new HttpError(400, '文件直链仅支持 http/https 协议');
-  }
+// Vercel 函数的请求体上限约 4MB，超过的文件请走 FileBrowser 网页上传后填直链
+const FB_MAX_BYTES = 4 * 1024 * 1024;
+const ALLOWED_EXT = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'];
 
-  let upstream;
+function fbConfig() {
+  const base = text(process.env.FB_URL).replace(/\/+$/, '');
+  const user = text(process.env.FB_USER);
+  const pass = process.env.FB_PASS || '';
+  if (!base || !user || !pass) {
+    throw new HttpError(500, '服务端未配置 FileBrowser（FB_URL / FB_USER / FB_PASS）');
+  }
+  if (!/^https?:\/\//i.test(base)) throw new HttpError(500, 'FB_URL 必须以 http:// 或 https:// 开头');
+
+  let dir = text(process.env.FB_DIR) || '/docs';
+  if (!dir.startsWith('/')) dir = `/${dir}`;
+  dir = dir.replace(/\/+$/, '');
+
+  return { base, user, pass, dir };
+}
+
+// 目录/文件名逐段编码，避免中文与空格导致路径错误
+function encodePath(rawPath) {
+  return rawPath
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
+
+function splitExt(name) {
+  const match = /^(.+)\.([a-zA-Z0-9]+)$/.exec(name || '');
+  return match ? { base: match[1], ext: match[2].toLowerCase() } : { base: name || 'file', ext: '' };
+}
+
+let fbToken = null;
+let fbTokenAt = 0;
+
+async function fbAuth(force = false) {
+  const { base, user, pass } = fbConfig();
+  if (!force && fbToken && Date.now() - fbTokenAt < 30 * 60 * 1000) return fbToken;
+
+  let res;
   try {
-    upstream = await fetch(target.toString(), {
-      headers: { Accept: 'application/pdf,application/octet-stream,*/*' },
-      redirect: 'follow',
+    res = await fetch(`${base}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user, password: pass }),
     });
   } catch {
-    throw new HttpError(502, '无法连接到 FileBrowser 文件服务');
+    throw new HttpError(502, '无法连接到 FileBrowser，请检查 FB_URL 是否可从公网访问');
   }
+  if (!res.ok) throw new HttpError(502, `FileBrowser 登录失败（HTTP ${res.status}），请核对 FB_USER / FB_PASS`);
+
+  const raw = (await res.text()).trim();
+  let token = raw;
+  if (raw.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(raw);
+      token = parsed.token || parsed.accessToken || parsed.jwt || '';
+    } catch {
+      token = '';
+    }
+  }
+  token = token.replace(/^"|"$/g, '');
+  if (!token) throw new HttpError(502, 'FileBrowser 登录返回内容异常，请检查账号密码');
+
+  fbToken = token;
+  fbTokenAt = Date.now();
+  return token;
+}
+
+// FileBrowser 里确保上传目录存在（POST 以 / 结尾即创建目录）
+async function fbEnsureDir(dir, token) {
+  const res = await fetch(`${fbConfig().base}/api/resources${encodePath(dir)}/?override=true`, {
+    method: 'POST',
+    headers: { 'X-Auth': token },
+  });
+  // 目录已存在会返回 409，属正常情况
+  if (!res.ok && res.status !== 409) {
+    throw new HttpError(502, `FileBrowser 创建目录失败（HTTP ${res.status}）`);
+  }
+}
+
+async function uploadToFileBrowser(req) {
+  await requireAdmin(req);
+  const { base, dir } = fbConfig();
+
+  let form;
+  try {
+    form = await req.formData();
+  } catch {
+    throw new HttpError(400, '上传数据解析失败，请重试；大于 4MB 的文件请直接在 FileBrowser 上传后填直链');
+  }
+
+  const file = form.get('file');
+  if (!file || typeof file === 'string') throw new HttpError(400, '请选择要上传的文件');
+  if (file.size <= 0) throw new HttpError(400, '文件内容为空');
+  if (file.size > FB_MAX_BYTES) {
+    throw new HttpError(413, '文件超过 4MB，请改在 FileBrowser 网页上传后把直链粘贴到「外部直链」');
+  }
+
+  const original = file.name || 'file';
+  const { base: stem, ext } = splitExt(original);
+  if (!ext || !ALLOWED_EXT.includes(ext)) {
+    throw new HttpError(400, `仅支持 ${ALLOWED_EXT.join(' / ')} 格式`);
+  }
+
+  const safeStem = stem.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 60) || 'file';
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const suffix = Math.random().toString(36).slice(2, 6);
+  const fileName = `${stamp}-${safeStem}-${suffix}.${ext}`;
+  const filePath = `${dir}/${fileName}`;
+
+  let token = await fbAuth();
+  await fbEnsureDir(dir, token);
+
+  let res = await fetch(`${base}/api/resources${encodePath(filePath)}?override=true`, {
+    method: 'POST',
+    headers: { 'X-Auth': token, 'Content-Type': 'application/octet-stream' },
+    body: file,
+  });
+
+  if (res.status === 401 || res.status === 403) {
+    token = await fbAuth(true);
+    await fbEnsureDir(dir, token);
+    res = await fetch(`${base}/api/resources${encodePath(filePath)}?override=true`, {
+      method: 'POST',
+      headers: { 'X-Auth': token, 'Content-Type': 'application/octet-stream' },
+      body: file,
+    });
+  }
+
+  if (!res.ok) {
+    throw new HttpError(502, `上传到 FileBrowser 失败（HTTP ${res.status}）`);
+  }
+
+  return json(
+    { file_path: filePath, file_name: `${safeStem}.${ext}`, size: file.size },
+    201
+  );
+}
+
+/**
+ * 文件读取：优先用 FileBrowser 里上传的文件（file_path，服务端带鉴权转发），
+ * 兼容旧数据中的外部直链（file_url）。仅按文档 id 取库中登记的文件，不接收任意 URL。
+ */
+async function streamDocFile(url, { attachment = false } = {}) {
+  const sql = getSql();
+  const id = parseId(url.searchParams.get('id'));
+  const rows = await sql`SELECT file_path, file_url, file_name FROM docs WHERE id = ${id}`;
+  const doc = rows[0];
+  if (!doc) throw new HttpError(404, '文件不存在或已被删除');
+
+  const fbPath = doc.file_path;
+  const fileUrl = doc.file_url;
+  if (!fbPath && !fileUrl) throw new HttpError(404, '该文件未配置附件');
+
+  let upstream;
+
+  if (fbPath) {
+    const { base } = fbConfig();
+    const target = `${base}/api/raw${encodePath(fbPath)}`;
+    let token = await fbAuth();
+    upstream = await fetch(target, { headers: { 'X-Auth': token }, redirect: 'follow' });
+    if (upstream.status === 401 || upstream.status === 403) {
+      token = await fbAuth(true);
+      upstream = await fetch(target, { headers: { 'X-Auth': token }, redirect: 'follow' });
+    }
+  } else {
+    let target;
+    try {
+      target = new URL(fileUrl);
+    } catch {
+      throw new HttpError(400, '文件直链格式不正确');
+    }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+      throw new HttpError(400, '文件直链仅支持 http/https 协议');
+    }
+    try {
+      upstream = await fetch(target.toString(), {
+        headers: { Accept: 'application/pdf,application/octet-stream,*/*' },
+        redirect: 'follow',
+      });
+    } catch {
+      throw new HttpError(502, '无法连接到文件服务');
+    }
+  }
+
   if (!upstream.ok || !upstream.body) {
     throw new HttpError(502, `文件获取失败（HTTP ${upstream.status}）`);
   }
 
+  const displayName = doc.file_name || (fbPath ? fbPath.split('/').pop() : '文件');
+  const encodedName = encodeURIComponent(displayName);
+
   return new Response(upstream.body, {
     status: 200,
     headers: {
-      'Content-Type': upstream.headers.get('content-type') || 'application/pdf',
-      'Content-Disposition': 'inline',
+      'Content-Type': upstream.headers.get('content-type') || 'application/octet-stream',
+      'Content-Disposition': `${attachment ? 'attachment' : 'inline'}; filename*=UTF-8''${encodedName}`,
       'Cache-Control': 'private, max-age=300',
       'X-Content-Type-Options': 'nosniff',
     },
@@ -476,8 +649,13 @@ export default async function handler(req) {
       case 'doc':
         return await getDoc(url);
       case 'pdf':
-        return await proxyPdf(url);
+        return await streamDocFile(url, { attachment: false });
+      case 'download':
+        return await streamDocFile(url, { attachment: true });
 
+      case 'upload':
+        requirePost(method);
+        return await uploadToFileBrowser(req);
       case 'login':
         requirePost(method);
         return await login(req);
